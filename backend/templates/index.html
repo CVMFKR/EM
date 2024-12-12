@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Estación Meteorológica</title>
+</head>
+<body>
+    <h1>Estación Meteorológica</h1>
+    <p>Temperatura: {{ temperature }}°C</p>
+    <p>Humedad: {{ humidity }}%</p>
+    
+    <form action="/control" method="post">
+        <button type="submit" name="action" value="turn_on_extractor">Encender Extractor</button>
+        <button type="submit" name="action" value="turn_off_extractor">Apagar Extractor</button>
+    </form>
+</body>
+</html>
