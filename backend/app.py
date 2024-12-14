@@ -1,191 +1,156 @@
-import logging
-import sqlite3
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import board
-import adafruit_dht
-import time
+from flask import Flask, request, jsonify, render_template
+from flask import Response
+import cv2  # Librería para trabajar con la cámara
 import RPi.GPIO as GPIO
-from datetime import datetime
+import atexit
+import adafruit_dht
+import board
+import time
+import threading
 
-# Configuración del logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("iot_logs.log", mode="a")
-    ]
-)
-
-logging.info("Backend iniciado correctamente.")
-
-# Inicialización de Flask y configuración de CORS
 app = Flask(__name__)
-CORS(app)
+# Inicializar la cámara (asegúrate de que está conectada)
+camera = cv2.VideoCapture(0)  # Usa '0' para la cámara predeterminada
 
-# Configuración del modo de simulación (True = simulación, False = control real con GPIO)
-modo_simulacion = True
 
-# Configuración de GPIO
-GPIO.setmode(GPIO.BCM)
-
-# Pines de los actuadores
-RELAY_LED = 17
-RELAY_SALA_CONTROL = 27
-INTRACTOR = 22
-EXTRACTOR = 23
-VENTILACION = 24
-BOMBA_AGUA = 25
-MOTOR_BASE_GIRATORIA = 5
-HUMIDIFICADOR = 6
-
-# Configuración de pines como salida (solo si no es simulación)
-if not modo_simulacion:
-    actuadores = [RELAY_LED, RELAY_SALA_CONTROL, INTRACTOR, EXTRACTOR, VENTILACION, BOMBA_AGUA, MOTOR_BASE_GIRATORIA, HUMIDIFICADOR]
-    for actuador in actuadores:
-        GPIO.setup(actuador, GPIO.OUT)
-
-# Inicializar sensor DHT11
-dht_device = adafruit_dht.DHT11(board.D4)
-
-# Parámetros de control (pueden ser actualizados dinámicamente)
-parametros_control = {
-    'temp_min': 22,
-    'temp_max': 28,
-    'hum_min': 40,
-    'hum_max': 60
+# Configuración de GPIO para los actuadores
+actuadores = {
+    "led": 18,
+    "luz_control": 23,
+    "riego": 24,
+    "ventilador": 25,
+    "extractor": 12,
+    "intractor": 16,
+    "base_giratoria": 20,
 }
 
-# Inicialización de la base de datos
-def inicializar_base_datos():
-    conn = sqlite3.connect('estacion_meteorologica.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS datos_historicos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT NOT NULL,
-            temperatura REAL NOT NULL,
-            humedad REAL NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logging.info("Base de datos inicializada correctamente.")
+# Configuración del sensor DHT11
+DHT_SENSOR = adafruit_dht.DHT11(board.D17)  # Usamos GPIO17 para el sensor
 
-# Función para insertar datos en la base de datos
-def insertar_datos(temperature, humidity):
-    try:
-        conn = sqlite3.connect('estacion_meteorologica.db')
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO datos_historicos (fecha, temperatura, humedad)
-            VALUES (datetime('now'), ?, ?)
-        """, (temperature, humidity))
-        conn.commit()
-        conn.close()
-        logging.info("Datos insertados correctamente en la base de datos.")
-    except sqlite3.Error as e:
-        logging.error(f"Error al insertar en la base de datos: {e}")
+# Rango de temperatura y humedad
+TEMP_MIN = 23
+TEMP_MAX = 28
+HUMEDAD_MIN = 40
+HUMEDAD_MAX = 60
 
-# Función para controlar actuadores
-def controlar_actuador(actuador, accion):
-    devices = {
-        'led': RELAY_LED,
-        'sala_control': RELAY_SALA_CONTROL,
-        'intractor': INTRACTOR,
-        'extractor': EXTRACTOR,
-        'ventilacion': VENTILACION,
-        'bomba': BOMBA_AGUA,
-        'motor_base_giratoria': MOTOR_BASE_GIRATORIA,
-        'humidificador': HUMIDIFICADOR
-    }
+GPIO.setmode(GPIO.BCM)
+for pin in actuadores.values():
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
 
-    if actuador not in devices:
-        logging.warning(f"Actuador {actuador} no encontrado.")
-        return
+# Limpieza de GPIO al salir
+def limpiar_gpio():
+    GPIO.cleanup()
+    camera.release()
 
-    if modo_simulacion:
-        logging.info(f"Simulación: {actuador} {'encendido' if accion == 'on' else 'apagado'}.")
-    else:
-        pin = devices[actuador]
-        GPIO.output(pin, GPIO.HIGH if accion == 'on' else GPIO.LOW)
-        logging.info(f"{actuador} {'encendido' if accion == 'on' else 'apagado'}.")
+atexit.register(limpiar_gpio)
 
-# Función para obtener datos históricos
-def obtener_datos_historicos(dias=30):
-    conn = sqlite3.connect('estacion_meteorologica.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT fecha, temperatura, humedad
-        FROM datos_historicos
-        WHERE fecha >= datetime('now', ?)
-    ''', (f'-{dias} days',))
-    datos = cursor.fetchall()
-    conn.close()
-    return datos
-
-# Rutas de la API
-@app.route('/')
-def home():
-    return "Bienvenido a la Estación Meteorológica"
-
-@app.route('/sensor-data')
-def get_sensor_data():
-    logging.info("Intentando leer datos del sensor DHT11...")
-    max_retries = 5
-    for attempt in range(max_retries):
+# Función para leer el sensor DHT11 con reintentos y manejo de errores
+def leer_sensor():
+    intentos = 5
+    while intentos > 0:
         try:
-            temperature = dht_device.temperature
-            humidity = dht_device.humidity
-            if temperature is not None and humidity is not None:
-                logging.info(f"Datos obtenidos: Temperatura={temperature}°C, Humedad={humidity}%")
-                insertar_datos(temperature, humidity)
-                return jsonify({'temperature': temperature, 'humidity': humidity}), 200
-            else:
-                logging.warning(f"Lectura inválida en intento {attempt + 1}.")
+            temperatura = DHT_SENSOR.temperature
+            humedad = DHT_SENSOR.humidity
+            if temperatura is not None and humedad is not None:
+                return temperatura, humedad
+        except RuntimeError as error:
+            print(f"Error al leer el sensor: {error}")
         except Exception as e:
-            logging.error(f"Error leyendo del sensor: {e}")
-        time.sleep(1)
-    return jsonify({'error': 'No se pudieron obtener lecturas válidas del sensor'}), 500
+            print(f"Excepción inesperada: {e}")
+        intentos -= 1
+        time.sleep(2)
+    return None, None
 
-@app.route('/historico', methods=['GET'])
-def historico():
-    periodo = request.args.get('periodo', default=30, type=int)
-    if periodo not in [1, 7, 30]:
-        return jsonify({'error': 'Periodo no válido. Usa 1, 7 o 30.'}), 400
-    datos = obtener_datos_historicos(periodo)
-    return jsonify([
-        {'fecha': fecha, 'temperatura': temperatura, 'humedad': humedad}
-        for fecha, temperatura, humedad in datos
-    ])
+# Función para controlar los actuadores automáticamente según la temperatura y humedad
+def controlar_actuadores_automaticos():
+    temperatura, humedad = leer_sensor()
+    if temperatura is not None and humedad is not None:
+        print(f"Temperatura: {temperatura}°C, Humedad: {humedad}%")
+        if temperatura > TEMP_MAX:
+            GPIO.output(actuadores["ventilador"], GPIO.HIGH)
+            GPIO.output(actuadores["extractor"], GPIO.HIGH)
+        elif temperatura < TEMP_MIN:
+            GPIO.output(actuadores["intractor"], GPIO.HIGH)
+        else:
+            GPIO.output(actuadores["ventilador"], GPIO.LOW)
+            GPIO.output(actuadores["extractor"], GPIO.LOW)
+            GPIO.output(actuadores["intractor"], GPIO.LOW)
 
-@app.route('/control/<device>/<action>', methods=['POST'])
-def control_device(device, action):
+        if humedad < HUMEDAD_MIN:
+            GPIO.output(actuadores["riego"], GPIO.HIGH)
+        elif humedad > HUMEDAD_MAX:
+            GPIO.output(actuadores["riego"], GPIO.LOW)
+    else:
+        print("No se pudo leer el sensor correctamente.")
+
+# Ruta para obtener datos del sensor
+@app.route("/datos_sensor", methods=["GET"])
+def obtener_datos_sensor():
+    temperatura, humedad = leer_sensor()
+    if temperatura is not None and humedad is not None:
+        return jsonify({"temperatura": temperatura, "humedad": humedad})
+    else:
+        return jsonify({"error": "No se pudo leer el sensor"}), 500
+
+# Ruta para la página principal
+@app.route("/")
+def index():
     try:
-        controlar_actuador(device, action)
-        return jsonify({'status': f'{device} {action}'}), 200
+        temperatura, humedad = leer_sensor()
+        return render_template(
+            "index.html",
+            actuadores=actuadores,
+            temperatura=temperatura if temperatura else "N/A",
+            humedad=humedad if humedad else "N/A",
+        )
     except Exception as e:
-        logging.error(f"Error controlando {device}: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"Error al cargar la plantilla: {e}")
+        return "Error al cargar la página", 500
 
-@app.route('/parametros_control', methods=['POST'])
-def actualizar_parametros_control():
-    try:
-        parametros = request.json
-        global parametros_control
-        parametros_control.update(parametros)
-        logging.info(f"Parámetros actualizados: {parametros_control}")
-        return jsonify({'status': 'Parámetros actualizados', 'parametros': parametros_control}), 200
-    except Exception as e:
-        logging.error(f"Error actualizando parámetros: {e}")
-        return jsonify({'error': str(e)}), 500
+# Ruta para controlar actuadores manualmente
+@app.route("/actuador", methods=["POST"])
+def controlar_actuador():
+    data = request.json
+    dispositivo = data.get("dispositivo")
+    estado = data.get("estado")
+    if dispositivo not in actuadores:
+        return jsonify({"error": "Dispositivo no válido"}), 400
+    if estado not in ["on", "off"]:
+        return jsonify({"error": "Estado no válido, use 'on' o 'off'"}), 400
+    pin = actuadores[dispositivo]
+    GPIO.output(pin, GPIO.HIGH if estado == "on" else GPIO.LOW)
+    return jsonify({"estado": "success", "dispositivo": dispositivo, "estado_actual": estado})
 
-# Inicialización
-if __name__ == '__main__':
-    inicializar_base_datos()
-    try:
-        app.run(host='0.0.0.0', port=5001)
-    finally:
-        if not modo_simulacion:
-            GPIO.cleanup()
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+# Control automático cada 10 segundos
+def auto_control():
+    while True:
+        controlar_actuadores_automaticos()
+        time.sleep(10)
+        
+def gen_frames():
+    while True:
+        success, frame = camera.read()  # Leer un frame de la cámara
+        if not success:
+            break
+        else:
+            # Codificar el frame en formato JPEG
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame = buffer.tobytes()
+            # Transmitir el frame al cliente
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        
+
+# Iniciar el control automático en un hilo separado
+control_thread = threading.Thread(target=auto_control)
+control_thread.daemon = True
+control_thread.start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

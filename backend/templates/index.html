@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Estación Meteorológica</title>
+    <script>
+        function controlarActuador(dispositivo, estado) {
+            fetch('/actuador', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ dispositivo, estado })
+            })
+            .then(response => response.json())
+            .then(data => console.log(data));
+        }
+
+        async function actualizarDatosSensor() {
+            try {
+                const response = await fetch('/datos_sensor');
+                const data = await response.json();
+                if (data.error) {
+                    document.getElementById('sensor').innerText = "Error al leer el sensor.";
+                } else {
+                    document.getElementById('temperatura').innerText = `${data.temperatura} °C`;
+                    document.getElementById('humedad').innerText = `${data.humedad} %`;
+                }
+            } catch (error) {
+                console.error("Error al obtener datos del sensor:", error);
+            }
+        }
+
+        setInterval(actualizarDatosSensor, 10000);
+        window.onload = actualizarDatosSensor;
+    </script>
+</head>
+<body>
+    <h1>Estación Meteorológica</h1>
+    <div id="sensor">
+        <p>Temperatura: <span id="temperatura">{{ temperatura }}</span></p>
+        <p>Humedad: <span id="humedad">{{ humedad }}</span></p>
+    </div>
+
+    <h2>Control de Actuadores</h2>
+    {% for actuador, pin in actuadores.items() %}
+        <div>
+            <p>{{ actuador }}</p>
+            <button onclick="controlarActuador('{{ actuador }}', 'on')">Encender</button>
+            <button onclick="controlarActuador('{{ actuador }}', 'off')">Apagar</button>
+        </div>
+    {% endfor %}
+
+    <!-- Nueva sección para la transmisión en vivo -->
+    <div>
+        <h2>Transmisión en Vivo</h2>
+        <img src="/video_feed" width="640" height="480" alt="Cargando transmisión...">
+    </div>
+</body>
+</html>
+
